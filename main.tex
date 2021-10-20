@@ -1,0 +1,351 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+
+\newtheorem*{remark}{Remark}
+
+\newcommand{\G}{\mathbb{G}}
+\newcommand{\F}{\mathbb{F}}
+\newcommand{\func}[1]{\mathsf{#1}}
+\newcommand{\com}{\func{Com}}
+\newcommand{\oracle}{\mathcal{O}_{\$}}
+
+\title{Haven Protocol technical notes}
+\author{Cypher Stack\thanks{\url{https://cypherstack.com}}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+
+This document describes technical information relevant to Haven Protocol.
+It reflects the intention of the protocol designers, but does not reflect any particular implementation and has not been independently reviewed.
+This document does not reflect a comprehensive protocol specification, and should not be used as such.
+The author asserts no warranty and disclaims liability for its use.
+The author further expresses no endorsement of Haven Protocol or its associated entities.
+
+
+\section{Introduction}
+
+Haven Protocol aims to permit signer-ambiguous confidential transactions using a modification of the Monero transaction protocol and its associated confidential transaction model \cite{ringct}.
+Assets in the protocol are of multiple independent types, and have a hidden value represented by a commitment.
+Transactions consume one or more assets of the same type, and produce new assets of arbitrary type.
+While individual asset values remain concealed in transactions, total input and output values for each type are revealed.
+An externally-provided public exchange rate is used to regulate balance validity, where a transaction is valid if (but not only if) input and output asset values balance according to this rate.
+
+In this technical note, we provide a description of the relevant cryptography used to achieve these goals, discuss practical security, and suggest improvements and best practices to improve the protocol.
+However, we do not provide a formal security model or proofs for the protocol, and this note should not be interpreted as doing so.
+
+
+\section{Constructions}
+
+The Haven Protocol transaction model, like that of \cite{ringct}, integrates several cryptographic constructions.
+We briefly describe relevant constructions here, but refer the reader elsewhere for further details.
+
+\subsection{Pedersen commitment}
+
+Amounts in assets are hidden using Pedersen commitments.
+Let the public parameters for a Pedersen commitment scheme be $pp_{\text{com}} = (\G,\F,G,H)$, where $\G$ is a prime-order group where the discrete logarithm problem is hard, $\F$ is its scalar field, and $G,H \in \G$ are randomly-sampled generators.
+The commitment scheme is a function $\com: \F \times \F \to \G$ defined by $\com(v,r) = vG + rH$, where we refer to $v$ as the \textit{value} and $r$ as the \textit{mask}.
+Pedersen commitments are perfectly hiding, computationally binding, and additively homomorphic, such that
+$$\com(v,r) + \com(v',r') = \com(v + v',r + r')$$
+for all $v,v',r,r' \in \F$.
+
+\subsection{Discrete logarithm proofs}
+
+While not used specifically in the existing protocol, we will rely in our later recommendations on a zero-knowledge discrete logarithm proving system that asserts the prover knows the discrete logarithm of a given group element with respect to a given generator.
+Let the public parameters for a discrete logarithm proving system by $pp_{\text{dl}} = (\G,\F)$, where $\G$ is a prime-order group where the discrete logarithm problem is hard, and $\F$ is its scalar field.
+The proving system consists of functions $\func{DLProve}$ and $\func{DLVerify}$ for the following relation:
+$$\{pp_{\text{dl}}, G, Y \in \G ; y \in \F : Y = yG\}$$
+
+The simple and well-known Schnorr proving system can be used for this purpose.
+
+\subsection{Range proofs}
+
+Because balance relies on sums and differences of committed values and $\G$ is a prime-order group, it is necessary to assert that committed amounts are unlikely to effectively bind to negative values.
+To do so, we require the use of a zero-knowledge range proving system that asserts a Pedersen commitment binds to a value within a specified range.
+Let the public parameters for a range proving scheme be $pp_{\text{rp}} = (pp_{\text{com}},n)$, where $pp_{\text{com}}$ is a set of public parameters for a Pedersen commitment scheme and the desired value range is $[0,2^n)$.
+The range proving scheme consists of functions $\func{RangeProve}$ and $\func{RangeVerify}$ for the following relation:
+$$\{pp_{\text{rp}}, C \in \G ; v, r \in \F : v \in [0,2^n), C = \com(v,r)\}$$
+
+It is also possible in some instantiations to permit aggregation of independent value assertions within the same proof, which allows for improved efficiency.
+In this case, the range proving system is generalized to functions $\func{AggregateRangeProve}$ and $\func{AggregateRangeVerify}$ for the following relation:
+\begin{multline*}
+\{pp_{\text{rp}}, \{C_j\}_{j=0}^{t-1} \subset \G ; \{(v_j, r_j)\}_{j=0}^{t-1} \subset \F^2 : \\
+v_j \in [0,2^n) \forall j \in [0,t), C_j = \com(v_j,r_j) \forall j \in [0,t)\}
+\end{multline*}
+
+In practice, constructions like Bulletproofs \cite{bp} or Bulletproofs+ \cite{bpplus} are efficient instantiations of range proving schemes that permit value aggregation.
+Haven Protocol selects Bulletproofs for this purpose.
+
+\subsection{Linkable ring signature}
+
+Signer ambiguity in the context of Haven Protocol requires the use of a 2-linkable ring signature (2-LRS) scheme.
+In such a construction, the signer provides a list of group element pairs, and shows (in at least a witness-indistinguishable manner) that at least one such pair consists of independent Pedersen commitments to zero for which it knows the corresponding openings.
+Further, a linkability property asserts that attempts to generate multiple signatures with the same key can be publicly detected; in the context of the transaction protocol, this would constitute a double-spend attempt and be rejected by consensus rules.
+There are several security models reflecting general ring signature and linkable ring signature constructions, but we consider the definitions in \cite{clsag} for this work.
+
+Let $pp_{\text{lrs}} = (pp_{\text{com}},N)$ be the public parameters for a 2-LRS scheme, where $pp_{\text{com}}$ is a set of public parameters for a Pedersen commitment scheme and $N$ is the size of the input list.
+The 2-LRS consists of functions $\func{LRSSign}$, $\func{LRSVerify}$, and $\func{LRSLink}$ that respectively produce signatures, verify signatures, and determine if signatures are linked by a common signer.
+
+Constructions like MLSAG \cite{ringct}, CLSAG \cite{clsag}, and Triptych \cite{triptych} can be used for this purpose, with different tradeoffs in efficiency and applications.
+Haven Protocol selects CLSAG for this purpose.
+
+\begin{remark}
+We note that the selection of range proof and 2-LRS schemes may necessitate additional requirements on the group $\G$ chosen.
+Fortunately, common elliptic curve groups satisfy typical cryptographic hardness assumptions.
+Haven Protocol selects the prime-order subgroup of the \texttt{ed25519} elliptic curve group for this purpose.
+\end{remark}
+
+
+\section{Protocol description}
+
+We describe how Haven Protocol defines assets, as well as the proofs and signatures required to authorize their transfer.
+
+
+\subsection{Assets}
+
+Assets are represented by outputs, which are structures generically containing (among other data) the following:
+\begin{itemize}
+    \item a public key $P \in \G$, the private key $p \in \F$ of which is required to authorize a transaction consuming the output
+    \item a value commitment $C \in \G$, the value of which is encrypted to the recipient
+    \item a type flag $T$ identifying the asset type
+\end{itemize}
+
+
+\subsection{Transfer transactions}
+
+Transfer transactions consume outputs of a single type $T$, and generate outputs of the same type.
+These transactions operate effectively the same as in \cite{ringct}.
+Suppose such a transaction consumes $w \geq 1$ outputs, and generates $t > 1$ outputs.
+We consider the method by which the sender produces output public keys $\{P_j\}_{j=0}^{t-1}$ and other auxiliary transaction data outside the scope of this analysis, so we focus instead on value-based operations.
+
+The sender does the following (among other steps):
+\begin{enumerate}
+    \item Gathers an input cover set $\{P_i,C_i\}_{i=0}^{N-1}$ of outputs of type $T$ such that for all $u = [0,w)$, the value $l_u$ represents the index of a consumed output within this set.
+    That is, we define this index such that $P_{l_u} = \com(0,p_u)$ for output private key $p_u$, and $C_{l_u} = \com(v_u,x_u)$ for known value and mask $v_u$ and $x_u$.
+    \item Selects a fee $f \in \F$.
+    \item For each $j \in [0,t)$, produces a new generated output:
+    \begin{enumerate}
+        \item Generates the output public key $\overline{P}_j$ according to protocol-specific rules.
+        \item Chooses a value $\overline{v}_j \in \F$ for the output, selects a mask $\overline{x}_j \in \F$ uniformly at random, and computes the output value commitment $\overline{C}_j = \com(\overline{v}_j,\overline{x}_j)$.
+    \end{enumerate}
+    \item\label{step:transfer-prover-input-masks} For each $u \in [0,w-1)$, selects a mask $x_u' \in \F$ uniformly at random, and computes a consumed output value commitment offset $C_u' = \com(v_u,x_u')$ to the same value as $C_{l_u}$.
+    \item\label{step:transfer-prover-last-mask} Computes the final mask $$x_{w-1}' = \sum_{j=0}^{t-1} \overline{x}_j - \sum_{u=0}^{w-2} x_u'$$ and consumed output value commitment offset $C_{w-1}' = \com(v_{w-1},x_{w-1}')$.
+    \item For each $u \in [0,w-1)$, generates an authorizing signature $\sigma_u$ using $\func{LRSSign}(pp_{\text{lrs}})$ showing that, among the set $\{P_i, C_i - C_u'\}_{i=0}^{N-1}$, the signer knows the commitment openings to both $P_{l_u}$ and $C_{l_u} - C_u'$.
+    \item Generates one or more range proofs on generated outputs:
+    \begin{enumerate}
+        \item If the range proving system supports aggregation, produces a single range proof on all generated outputs:
+        $$\Pi_{\text{rp}} = \func{AggregateRangeProve}(pp_{\text{rp}},\{\overline{C}_j\}_{j=0}^{t-1} ; \{(\overline{v}_j, \overline{x}_j)\}_{j=0}^{t-1})$$
+        \item Otherwise, produces a separate range proof for each $j \in [0,t)$:
+        $$(\Pi_{\text{rp}})_j = \func{RangeProve}(pp_{\text{rp}},\overline{C}_j ; \overline{v}_j, \overline{x}_j)$$
+    \end{enumerate}
+\end{enumerate}
+
+We require specifically that the transaction balance, which means that $$\sum_{u=0}^{w-1} v_u - \sum_{j=0}^{t-1} \overline{v}_j - f = 0.$$
+
+To verify a transfer transaction, a verifier does the following (among other steps):
+\begin{enumerate}
+    \item For each $u \in [0,w)$, uses $\func{LRSVerify}$ to verify that $\sigma_u$ is a valid signature.
+    \item Verifies any range proofs using either $\func{RangeVerify}$ or $\func{AggregateRangeVerify}$, as appropriate.
+    \item Confirms that the fee $f$ is within an implementation-specific valid range.
+    \item\label{step:transfer-balance} Checks that $$\sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{t-1} \overline{C}_j - \com(f,0) = 0.$$
+\end{enumerate}
+
+Since the commitment scheme is computationally binding, the validity of signatures $\{\sigma_u\}_{u=0}^{w-1}$ asserts that each $C_{l_u}$ and $C_u'$ bind to the same value except with negligible probability.
+Further, if the transaction balances, then verification step \ref{step:transfer-balance} holds; the converse holds except with negligible probability since the commitment scheme is computationally binding.
+
+
+\subsection{Conversion transactions}
+
+Conversion transactions consume outputs of a single type, but generate outputs of two different types: the consumed output type and a converted type.
+Suppose that such a transaction consumes $w \geq 1$ outputs.
+Let $T$ represent the type flag of the consumed outputs, and $T'$ represent the type flag of the converted outputs.
+Let $n_T \geq 1$ be the number of generated outputs of type $T$, and $n_{T'} \geq 1$ be the number of generated outputs of type $T'$.
+Let $t = n_T + n_{T'}$.
+
+We assume the existence of a trusted external price oracle $\oracle$ whose values are public and immutable.
+On inputs $T$ and $T'$, the oracle $\oracle$ returns a nonzero value $r \in \F$ representing the conversion rate between asset values of these types.
+That is, a value conversion is correct if, for a rate $r = \oracle(T,T')$, value $v_T$ of type $T$, and value $v_{T'}$ of type $T'$, the equation $v_{T'} = rv_T$ holds.
+We stress that the assumptions on the oracle are broad, and that practical security is likely to depend highly on the properties of this oracle; for the purposes of this protocol description, we consider an abstract idealized oracle.
+
+The sender does the following (among other steps):
+\begin{enumerate}
+    \item Gathers an input cover set $\{P_i,C_i\}_{i=0}^{N-1}$ of outputs of type $T$ such that for all $u = [0,w)$, the value $l_u$ represents the index of a consumed output within this set.
+    That is, we define this index such that $P_{l_u} = \com(0,p_u)$ for output private key $p_u$, and $C_{l_u} = \com(v_u,x_u)$ for known value and mask $v_u$ and $x_u$.
+    \item Queries a conversion rate $r = \oracle(T,T')$.
+    \item Selects a fee $f$ in $T$ units.
+    \item For each $j \in [0,n_T)$, produces a new generated output of type $T$:
+    \begin{enumerate}
+        \item Generates the output public key $\overline{P}_j$ according to protocol-specific rules.
+        \item Chooses a value $\overline{v}_j \in \F$ in $T$ units for the output, selects a mask $\overline{x}_j \in \F$ uniformly at random, and computes the output value commitment $\overline{C}_j = \com(\overline{v}_j,\overline{x}_j)$.
+    \end{enumerate}
+    \item For each $j \in [n_T,t)$, produces a new generated output of type $T'$:
+    \begin{enumerate}
+        \item Generates the output public key $\overline{P}_j$ according to protocol-specific rules.
+        \item Chooses a value $\overline{v}_j \in \F$ in $T'$ units for the output, selects a mask $\overline{x}_j \in \F$ uniformly at random, and computes the output value commitment $\overline{C}_j = \com(\overline{v}_j,\overline{x}_j)$.
+    \end{enumerate}
+    \item\label{step:conversion-prover-input-masks} For each $u \in [0,w-1)$, selects a mask $x_u' \in \F$ uniformly at random, and computes a consumed output value commitment offset $C_u' = \com(v_u,x_u')$ to the same value as $C_{l_u}$.
+    \item\label{step:conversion-prover-last-mask} Computes the final mask $$x_{w-1}' = \sum_{j=0}^{n_T-1} \overline{x}_j + \frac{1}{r}\sum_{j=n_T}^{t-1} \overline{x}_j - \sum_{u=0}^{w-2} x_u'$$ and consumed output value commitment offset $C_{w-1}' = \com(v_{w-1},x_{w-1}')$.
+    \item For each $u \in [0,w-1)$, generates an authorizing signature $\sigma_u$ using $\func{LRSSign}(pp_{\text{lrs}})$ showing that, among the set $\{P_i, C_i - C_u'\}_{i=0}^{N-1}$, the signer knows the commitment openings to both $P_{l_u}$ and $C_{l_u} - C_u'$.
+    \item Generates one or more range proofs on generated outputs:
+    \begin{enumerate}
+        \item If the range proving system supports aggregation, produces a single range proof on all generated outputs:
+        $$\Pi_{\text{rp}} = \func{AggregateRangeProve}(pp_{\text{rp}},\{\overline{C}_j\}_{j=0}^{t-1} ; \{(\overline{v}_j, \overline{x}_j)\}_{j=0}^{t-1})$$
+        \item Otherwise, produces a separate range proof for each $j \in [0,t)$:
+        $$(\Pi_{\text{rp}})_j = \func{RangeProve}(pp_{\text{rp}},\overline{C}_j ; \overline{v}_j, \overline{x}_j)$$
+    \end{enumerate}
+    \item\label{step:conversion-prover-mask-sums} Generates the following commitment mask sums:
+    \begin{align*}
+        a_T =& \sum_{u=0}^{w-1} x_u' \\
+        \overline{a}_T =& \sum_{j=0}^{n_T-1} \overline{x}_j
+    \end{align*}
+    \item Computes the net value sums in each asset type:
+    \begin{align*}
+        y_T =& \sum_{u=0}^{w-1} v_u - \sum_{j=0}^{n_T-1} \overline{v}_j - f \\
+        y_{T'} =& \sum_{j=n_T}^{t-1} \overline{v}_j
+    \end{align*}
+\end{enumerate}
+
+In this case, transaction balance requires that $$\sum_{u=0}^{w-1} v_u - \sum_{j=0}^{n_T-1} \overline{v}_j - \frac{1}{r}\sum_{j=n_T}^{t-1} \overline{v}_j - f = 0.$$
+
+To verify a conversion transaction, a verifier does the following (among other steps):
+\begin{enumerate}
+    \item Queries the conversion rate $r = \oracle(T,T')$ appropriate to the transaction.
+    \item For each $u \in [0,w)$, uses $\func{LRSVerify}$ to verify that $\sigma_u$ is a valid signature.
+    \item Verifies any range proofs using either $\func{RangeVerify}$ or $\func{AggregateRangeVerify}$ as appropriate.
+    \item Confirms that the fee $f$ is within an implementation-specific valid range.
+    \item\label{step:conversion-balance} Confirms the transaction balances by checking that $$\sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{n_T-1} \overline{C}_j - \frac{1}{r}\sum_{j=n_T}^{t-1} \overline{C}_j - \com(f,0) = 0.$$
+    \item\label{step:conversion-value-T} Confirms the type-$T$ amount by checking that $$\sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{n_T-1} \overline{C}_j - \com(f, 0) - \com(0,a_T - \overline{a}_T) - \com(y_T,0) = 0.$$
+    \item\label{step:conversion-value-T-prime} Confirms the plaintext type-$T'$ amount by checking that $y_{T'} - ry_T = 0$.
+\end{enumerate}
+
+If the transaction balances, then verification steps \ref{step:conversion-balance}, \ref{step:conversion-value-T}, and \ref{step:conversion-value-T-prime} hold; the converses hold except with negligible probability since the commitment scheme is computationally binding.
+
+
+\section{Observations and recommendations}
+
+In this section, we make observations and propose changes to the protocol to improve its practical security.
+
+\subsection{Remove the plaintext type-\texorpdfstring{$T'$}{T'} amount check}
+\label{rec:remove-amount-check}
+
+While the type-$T$ amount $y_T$ is verified in conversion transactions by testing its relationship to the relevant commitments in verification step \ref{step:conversion-value-T}, the type-$T'$ amount $y_{T'}$ is never tested against commitments.
+Rather, it only appears in the check in verification step \ref{step:conversion-value-T-prime}, where its presence in the transaction structure and algorithms is unnecessary and offers no additional security.
+An adversary who can produce a transaction that passes verification steps \ref{step:conversion-balance} and \ref{step:conversion-value-T}, but produce type-$T'$ commitments to an unexpected total value, would break the binding property of the commitment scheme.
+The value $y_{T'}$ and associated check in step \ref{step:conversion-value-T-prime} can therefore be safely removed, and this value can simply be computed by the verifier as needed for other purposes.
+
+
+\subsection{Reveal a single aggregate type-\texorpdfstring{$T$}{T} commitment mask}
+\label{rec:single-mask}
+
+In conversion transaction generation step \ref{step:conversion-prover-mask-sums}, mask sums $a_T$ and $\overline{a}_T$ are computed.
+However, in verification step \ref{step:conversion-value-T}, only their difference $a_T - \overline{a}_T$ is used, yielding no additional security by including both values in transaction data.
+Since no additional checks are required or performed on the individual values, only the difference needs to be included in the transaction data.
+
+
+\subsection{Replace aggregate type-\texorpdfstring{$T$}{T} commitment masks with representation proof}
+\label{rec:zk-masks-T}
+
+In conversion transactions, commitment mask sums are uniformly distributed, but they are not independent.
+In particular, the mask equation
+$$\sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j - \frac{1}{r}\sum_{j=n_T}^{t-1} \overline{x}_j = 0$$
+holds.
+When a user produces a conversion transaction that reveals mask terms, it can leak information that depends on the particular transaction input and output structure.
+To mitigate this leakage, it is possible to modify the protocol to instead prove knowledge of the commitment mask sums, rather than reveal them.
+Because amount verification requires the use of these sums, the check in verification step \ref{step:conversion-value-T} also must be slightly modified.
+
+To do so, generation step \ref{step:conversion-prover-mask-sums} is replaced.
+Instead of revealing the mask sums $a_T$ and $\overline{a}_T$ in the transaction data, the prover instead defines
+$$A = \com\left( 0, \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j \right)$$
+and produces a discrete logarithm proof
+$$\Pi_{\text{dl},T} = \func{DLProve}\left( pp_{\text{dl}}, \com(0,1), A ; \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j \right)$$
+on this value, and includes $\Pi_{\text{dl},T}$ in the transaction.
+
+Verification step \ref{step:conversion-value-T} is then modified to account for this change.
+The verifier defines
+$$A' = \sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{n_T-1} \overline{C}_j - \com(f,0) - \com(y_T,0)$$
+and checks that $\func{DLVerify}(pp_{\text{dl}}, \com(0,1), A', \Pi_{\text{dl},T})$ succeeds.
+
+
+\subsection{Select all commitment masks independently}
+\label{rec:zk-masks}
+
+The balance equations used in the protocol (for both transfer and conversion transactions) relies on commitment masks being chosen in such a way that input commitment offsets and output commitments sum to zero.
+While this means that such masks can be distributed uniformly at random, they are not chosen independently for this reason.
+An adversary who knows all but one of these masks can therefore identify the remaining mask and corresponding value.
+Other transaction structures and components can also leak information.
+
+Similarly to the above notes on type-$T$ commitment mask sums, it is possible to choose all commitment masks independently and prove knowledge of them in zero knowledge.
+This means that knowledge of any particular subset of masks gives an adversary no inherent advantage in identifying unknown values.
+
+\subsubsection{Transfer transactions}
+
+To do this for transfer transactions, generation step \ref{step:transfer-prover-last-mask} is removed, and step \ref{step:transfer-prover-input-masks} is modified to select all masks uniformly at random independently.
+Because verifier step \ref{step:transfer-balance} no longer holds, the prover defines
+$$B = \com\left( 0, \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{t-1} \overline{x}_j \right)$$
+and produces a discrete logarithm proof
+$$\Pi_{\text{dl}} = \func{DLProve}\left( pp_{\text{dl}}, \com(0,1), B ; \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{t-1} \overline{x}_j \right)$$
+on this value, and includes $\Pi_{\text{dl}}$ in the transaction.
+
+The verification step \ref{step:transfer-balance} is then modified to account for this change.
+The verifier defines
+$$B' = \sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{t-1} \overline{C}_j - \com(f,0)$$
+and checks that $\func{DLVerify}(pp_{\text{dl}}, \com(0,1), B', \Pi_{\text{dl}})$ succeeds.
+
+
+\subsubsection{Conversion transactions}
+
+To do this for conversion transactions, generation step \ref{step:conversion-prover-last-mask} is removed, and step \ref{step:conversion-prover-input-masks} is modified to select all masks uniformly at random independently.
+Because verifier step \ref{step:conversion-balance} no longer holds, the prover defines
+$$B = \com\left( 0, \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j - \frac{1}{r} \sum_{j=n_T}^{t-1} \overline{x}_j \right)$$
+and produces a discrete logarithm proof
+$$\Pi_{\text{dl}} = \func{DLProve}\left( pp_{\text{dl}}, \com(0,1), B ; \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j - \frac{1}{r} \sum_{j=n_T}^{t-1} \overline{x}_j \right)$$
+on this value, and includes $\Pi_{\text{dl}}$ in the transaction.
+
+The verification step \ref{step:conversion-balance} is then modified to account for this change.
+The verifier defines
+$$B' = \sum_{u=0}^{w-1} C_u' - \sum_{j=0}^{n_T-1} \overline{C}_j - \frac{1}{r} \sum_{j=n_T}^{t-1} \overline{C}_j - \com(f,0)$$
+and checks that $\func{DLVerify}(pp_{\text{dl}}, \com(0,1), B', \Pi_{\text{dl}})$ succeeds.
+
+
+\subsection{Aggregate all discrete logarithm proofs}
+
+The recommendations in sections \ref{rec:zk-masks-T} and \ref{rec:zk-masks} each produce a proof of knowledge of a discrete logarithm against the same group generator, which can be considered proofs of commitments to zero.
+To optimize space and verifier efficiency, it may be desirable to combine these proofs.
+Doing so requires the use of an aggregate discrete logarithm proving system, which asserts knowledge of openings to multiple independent commitments to zero in zero knowledge.
+
+Let the public parameters of an aggregate discrete logarithm proving system be $pp_{\text{agg}} = (pp_{\text{com}},d)$, where $pp_{\text{com}}$ is a set of public parameters for a Pedersen commitment scheme and $d > 0$ is the number of commitments.
+The proving scheme consists of functions $\func{AggregateDLProve}$ and $\func{AggregateDLVerify}$ for the following relation:
+$$\{pp_{\text{agg}}, \{Y_i\}_{i=0}^{d-1} \subset \G ; \{y_i\}_{i=0}^{d-1} \subset \F : Y_i = \com(0,y_i) \forall i \in [0,d)\}$$
+
+The batching construction of Gennaro \textit{et al.} \cite{schnorr} is an efficient and straightforward instantiation of such a proving system.
+Proving knowledge of openings of $d > 1$ commitments to zero incurs the same communication cost as for $d = 1$ commitments, and the additional computational complexity is minimal.
+
+For completeness, we list the algorithm steps here; the reader is referred to \cite{schnorr} for details and security proofs.
+
+\begin{enumerate}
+    \item The prover chooses $r \in \F$ uniformly at random, sets $X = r\com(0,1)$, and sends $X$ to the verifier.
+    \item The verifier chooses $c \in \F \setminus \{0\}$ uniformly at random, and sends $c$ to the prover.
+    \item The prover sets $s = r + \sum_{i=0}^{d-1} y_i c^{i+1}$, and sends $s$ to the verifier.
+    \item The verifier checks that the equality $$X + \sum_{i=0}^{d-1} c^{i+1}Y_i = s\com(0,1)$$ holds.
+\end{enumerate}
+
+If applying both recommendations that use discrete logarithm representation proofs, the goal is to combine the two proofs $\Pi_{\text{dl},T}$ and $\Pi_{\text{dl}}$ into a single proof $\Pi_{\text{agg}}$ using this method.
+In this case, we use the notation from the previous sections and produce the proof
+$$\Pi_{\text{agg}} = \func{AggregateDLProve}(pp_{\text{agg}}, \{Y_0,Y_1\} ; \{y_0,y_1\}),$$
+where
+$$y_0 = \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j$$
+and $Y_0 = A$ are the witness and statement from $\Pi_{\text{dl},T}$ in section \ref{rec:zk-masks-T}, and
+$$y_1 = \sum_{u=0}^{w-1} x_u' - \sum_{j=0}^{n_T-1} \overline{x}_j - \frac{1}{r} \sum_{j=n_T}^{t-1} \overline{x}_j$$
+and $Y_1 = B$ are the witness and statement from $\Pi_{\text{dl}}$ in section \ref{rec:zk-masks}.
+
+Verification of this single aggregate proof with $\func{AggregateDLVerify}$ uses the corresponding verification statements described in those sections.
+
+
+\bibliographystyle{plain}
+\bibliography{main}
+
+\end{document}
